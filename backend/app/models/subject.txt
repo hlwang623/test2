@@ -1,0 +1,95 @@
+rom sqlalchemy import Column, Integer, String, Float, ForeignKey, DateTime, Enum as SQLEnum, Text, Boolean
+from sqlalchemy.orm import relationship
+from datetime import datetime
+import enum
+
+from app.core.database import Base
+
+
+class FileStatus(enum.Enum):
+    """文件解析状态 (MinerU/底层处理状态)"""
+    UPLOADING = "uploading"  # 上传中
+    PENDING = "pending"  # 等待解析
+    PARSING = "parsing"  # 解析中
+    READY = "ready"  # 解析完成
+    ERROR = "error"  # 解析失败
+
+
+class SubjectFile(Base):
+    """
+    科目文件表
+    一个科目可以包含多个文件 (PDF, PPT, Word)
+    """
+    __tablename__ = "subject_files"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # 外键关联到科目
+    subject_id = Column(Integer, ForeignKey("subjects.id"), nullable=False)
+    subject = relationship("Subject", back_populates="files")
+
+    # 文件基本信息
+    file_name = Column(String, nullable=False)  # 原始文件名
+    original_filename = Column(String, nullable=False)  # 用户上传时的原始文件名
+    pdf_path = Column(String, nullable=True)  # 转换后的 PDF 路径（如果原文件是 PDF 则为 None）
+    conversion_status = Column(String, default='pending')  # pending/converting/success/failed/not_needed
+    file_path = Column(String, nullable=False)  # 服务器存储路径
+    file_type = Column(String, nullable=False)  # pdf/ppt/pptx/doc/docx
+    file_size = Column(Integer, nullable=False)  # 字节数
+
+    # 单个文件的解析状态 (底层技术状态)
+    status = Column(SQLEnum(FileStatus), default=FileStatus.UPLOADING)
+
+    # pending: 待加入 | building: 构建中 | built: 已入图谱 | excluded: 不加入
+    graph_status = Column(String, default='pending')
+
+    parse_progress = Column(Float, default=0.0)  # 0-100
+
+    # MinerU / 提取结果
+    parsed_json_path = Column(String, nullable=True)  # JSON 结果路径
+    parsing_error = Column(Text, nullable=True) # 错误日志
+    parsed_content_path = Column(String, nullable=True)
+    parsed_at = Column(DateTime, nullable=True)
+    # TOC 缓存
+    toc_json = Column(Text, nullable=True)  # 存储生成的目录JSON
+    toc_generated_at = Column(DateTime, nullable=True)  # 目录生成时间
+
+    # 时间戳
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    is_deleted = Column(Boolean, default=False, index=True)
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class Subject(Base):
+    """
+    科目主表
+    """
+    __tablename__ = "subjects"
+    id = Column(Integer, primary_key=True, index=True)
+    # 基本信息
+    name = Column(String, nullable=False)
+    description = Column(String, nullable=True)
+    ai_instruction = Column(Text, nullable=True)
+
+    # 用户关联
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    user = relationship("User", back_populates="subjects")
+
+    # 关联文件列表
+    files = relationship("SubjectFile", back_populates="subject", cascade="all, delete-orphan")
+
+    # 知识图谱统计
+    total_nodes = Column(Integer, default=0)
+    learned_nodes = Column(Integer, default=0)
+
+    # 封面配色
+    cover_color = Column(String, default="blue")
+
+    # [明确添加] 科目整体状态
+    # empty: 无内容 | parsing: 构建中 | ready: 就绪
+    status = Column(String, default="empty")
+
+    # 时间戳
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

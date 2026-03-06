@@ -1,0 +1,82 @@
+import os
+import sys
+import logging
+import requests
+from pathlib import Path
+from typing import Union
+from config import CONVERSION_TIMEOUT
+
+# 设置日志
+logger = logging.getLogger(__name__)
+
+class ConversionError(Exception):
+    """自定义转换异常类"""
+    pass
+
+
+class OfficeConverter:
+    def __init__(self):
+        # 默认连接本地 Docker 的 3000 端口
+        self.gotenberg_url = os.getenv("GOTENBERG_URL", "http://localhost:3000")
+
+        # 简单测试一下连接
+        try:
+            requests.get(f"{self.gotenberg_url}/health", timeout=2)
+            logger.info(f"Connected to Gotenberg at {self.gotenberg_url}")
+        except Exception:
+            logger.warning(f"Could not connect to Gotenberg at {self.gotenberg_url}, is Docker running?")
+
+    def convert_to_pdf(self, input_path: Union[str, Path], output_dir: Union[str, Path]) -> Path:
+        """
+        将 Word/PPT 文档转换为 PDF
+        """
+        input_path = Path(input_path).resolve()
+        output_dir = Path(output_dir).resolve()
+
+        # 1. 基础校验
+        if not input_path.exists():
+            raise FileNotFoundError(f"Input file does not exist: {input_path}")
+
+        if not output_dir.exists():
+            os.makedirs(output_dir, exist_ok=True)
+
+        api_url = f"{self.gotenberg_url}/forms/libreoffice/convert"
+
+        logger.info(f"Sending {input_path.name} to Gotenberg...")
+
+        try:
+            # 2. 发送文件给 Docker
+            with open(input_path, "rb") as f:
+                # 'files' 是 Gotenberg 要求的字段名，不能改
+                files = {'files': (input_path.name, f)}
+                data = {
+                    'pdfFormat': 'PDF/A-1a'
+                }
+
+                # 发起 POST 请求
+                response = requests.post(api_url, files=files, data=data,timeout=CONVERSION_TIMEOUT)
+
+            # 3. 检查结果
+            if response.status_code == 200:
+                # 构造输出路径
+                output_filename = input_path.stem + ".pdf"
+                output_path = output_dir / output_filename
+
+                # 4. 将返回的二进制流写入文件
+                with open(output_path, "wb") as f_out:
+                    f_out.write(response.content)
+
+                return output_path
+            else:
+                # 处理错误
+                raise ConversionError(f"Gotenberg failed [{response.status_code}]: {response.text}")
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Network error connecting to Docker: {e}")
+            raise ConversionError("Failed to connect to PDF converter service.")
+        except Exception as e:
+            logger.exception(f"Unexpected error: {str(e)}")
+            raise ConversionError(f"System error: {str(e)}")
+
+# 单例模式导出
+converter = OfficeConverter()

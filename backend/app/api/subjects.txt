@@ -1,0 +1,511 @@
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Body
+from sqlalchemy.orm import Session
+from typing import List, Optional
+import os
+from datetime import datetime
+from pydantic import BaseModel
+from app.services.converter import converter, ConversionError
+from app.core.database import get_db
+from app.core.security import get_current_user
+from app.models.user import User
+from app.schemas.subject import SubjectResponse, SubjectList, SubjectCreate
+from app.crud import subject as crud_subject
+from fastapi import BackgroundTasks
+from ..services.task_handler import process_pdf_parsing
+from app.schemas.toc import TocResponse
+
+router = APIRouter(prefix="/api/subjects", tags=["subjects"])
+
+# --- 配置部分 ---
+UPLOAD_DIR = "uploads/subjects"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# 允许的文件类型
+ALLOWED_MIME_TYPES = [
+    "application/pdf",
+    "application/vnd.ms-powerpoint",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+]
+MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB
+
+
+# --- 辅助 Schema ---
+class SubjectUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+
+
+class AIInstructionUpdate(BaseModel):
+    # 注意：前端发来的 JSON key 是 instruction 还是 ai_instruction？
+    # 根据 SubjectService 代码，你发的是 { ai_instruction: "..." }
+    # 所以这里要在 Pydantic 里匹配上
+    ai_instruction: str
+
+
+# --- 接口部分 ---
+
+@router.post("/", response_model=SubjectResponse)
+async def create_subject(
+        subject_in: SubjectCreate,
+        current_user: User = Depends(get_current_user),
+        db: Session = Depends(get_db)
+):
+    new_subject = crud_subject.create_subject(db=db, subject=subject_in, user_id=current_user.id)
+    return new_subject
+
+
+@router.get("/", response_model=SubjectList)
+def get_my_subjects(
+        current_user: User = Depends(get_current_user),
+        db: Session = Depends(get_db)
+):
+    subjects = crud_subject.get_user_subjects(db, user_id=current_user.id)
+    return {
+        "subjects": subjects,
+        "total": len(subjects)
+    }
+
+
+@router.get("/{subject_id}", response_model=SubjectResponse)
+def get_subject(
+        subject_id: int,
+        current_user: User = Depends(get_current_user),
+        db: Session = Depends(get_db)
+):
+    subject = crud_subject.get_subject(db, subject_id=subject_id)
+    if not subject or subject.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="科目不存在或无权查看")
+
+    subject.files = [f for f in subject.files if not f.is_deleted]
+
+    return subject
+
+@router.patch("/{subject_id}", response_model=SubjectResponse)
+async def update_subject(
+        subject_id: int,
+        subject_update: SubjectUpdate,
+        current_user: User = Depends(get_current_user),
+        db: Session = Depends(get_db)
+):
+    """更新科目信息"""
+    subject = crud_subject.get_subject(db, subject_id=subject_id)
+    if not subject or subject.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="科目不存在或无权操作")
+
+    # 仅更新非空字段
+    update_data = subject_update.model_dump(exclude_unset=True)
+    updated_subject = crud_subject.update_subject(db, db_obj=subject, obj_in=update_data)
+
+    return updated_subject
+
+@router.patch("/{subject_id}/ai_instruction")
+async def update_ai_instruction(
+        subject_id: int,
+        instruction_in: AIInstructionUpdate,
+        current_user: User = Depends(get_current_user),
+        db: Session = Depends(get_db)
+):
+    """更新科目的 AI 指示"""
+    subject = crud_subject.get_subject(db, subject_id=subject_id)
+    if not subject or subject.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="科目不存在")
+
+    # 调用通用的 update_subject，但只更新 ai_instruction 字段
+    crud_subject.update_subject(db, db_obj=subject, obj_in={"ai_instruction": instruction_in.ai_instruction})
+
+    return {"message": "AI instruction updated successfully", "subject_id": subject_id}
+
+
+@router.delete("/{subject_id}")
+def delete_subject(
+        subject_id: int,
+        current_user: User = Depends(get_current_user),
+        db: Session = Depends(get_db)
+):
+    subject = crud_subject.get_subject(db, subject_id=subject_id)
+    if not subject or subject.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="科目不存在")
+
+    # 物理删除
+    for file_record in subject.files:
+        if os.path.exists(file_record.file_path):
+            try:
+                os.remove(file_record.file_path)
+            except:
+                pass
+
+    crud_subject.delete_subject(db, subject_id=subject_id)
+    return {"message": "删除成功"}
+
+@router.delete("/{subject_id}/files/{file_id}")
+async def delete_file(
+        subject_id: int,
+        file_id: int,
+        current_user: User = Depends(get_current_user),
+        db: Session = Depends(get_db)
+):
+    """删除科目下的单个文件"""
+    # 1. 验证科目权限
+    subject = crud_subject.get_subject(db, subject_id=subject_id)
+    if not subject or subject.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="无权操作此科目")
+
+    # 2. 验证文件存在性 (现在调用的是存在的 get_file 了)
+    file_record = crud_subject.get_file(db, file_id=file_id)
+    if not file_record or file_record.subject_id != subject_id:
+        raise HTTPException(status_code=404, detail="文件不存在或不属于该科目")
+
+    # 3. 物理删除
+    if os.path.exists(file_record.file_path):
+        try:
+            os.remove(file_record.file_path)
+        except Exception as e:
+            print(f"警告：物理文件删除失败 - {str(e)}")
+
+    # 4. 数据库删除
+    crud_subject.delete_file(db, file_id=file_id)
+
+    return {"message": "File moved to trash", "file_id": file_id}
+
+
+@router.get("/{subject_id}/trash")
+async def get_trash_files(
+        subject_id: int,
+        current_user: User = Depends(get_current_user),
+        db: Session = Depends(get_db)
+):
+    """获取科目回收站中的文件"""
+    # 验证科目权限
+    subject = crud_subject.get_subject(db, subject_id=subject_id)
+    if not subject or subject.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="无权访问")
+
+    trash_files = crud_subject.get_trash_files(db, subject_id)
+
+    return {
+        "files": trash_files,
+        "total": len(trash_files)
+    }
+
+
+@router.post("/{subject_id}/files/{file_id}/restore")
+async def restore_file(
+        subject_id: int,
+        file_id: int,
+        current_user: User = Depends(get_current_user),
+        db: Session = Depends(get_db)
+):
+    """从回收站还原文件"""
+    # 验证科目权限
+    subject = crud_subject.get_subject(db, subject_id=subject_id)
+    if not subject or subject.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="无权操作")
+
+    # 验证文件存在性
+    file_record = crud_subject.get_file(db, file_id=file_id)
+    if not file_record or file_record.subject_id != subject_id:
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    if not file_record.is_deleted:
+        raise HTTPException(status_code=400, detail="文件未被删除")
+
+    # 还原
+    restored_file = crud_subject.restore_file(db, file_id)
+
+    return {"message": "File restored successfully", "file_id": file_id}
+
+
+@router.delete("/{subject_id}/files/{file_id}/permanent")
+async def permanent_delete_file(
+        subject_id: int,
+        file_id: int,
+        current_user: User = Depends(get_current_user),
+        db: Session = Depends(get_db)
+):
+    """从回收站彻底删除文件（不可恢复）"""
+    subject = crud_subject.get_subject(db, subject_id=subject_id)
+    if not subject or subject.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="无权操作")
+
+    file_record = crud_subject.get_file(db, file_id=file_id)
+    if not file_record or file_record.subject_id != subject_id:
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    success = crud_subject.permanent_delete_file(db, file_id=file_id)
+    if not success:
+        raise HTTPException(status_code=500, detail="删除失败")
+
+    return {"message": "File permanently deleted", "file_id": file_id}
+
+
+# --- 上传接口保持不变 ---
+@router.post("/{subject_id}/files/upload_only", response_model=SubjectResponse)
+async def upload_file_only(
+        subject_id: int,
+        background_tasks: BackgroundTasks,
+        file: UploadFile = File(...),
+        current_user: User = Depends(get_current_user),
+        db: Session = Depends(get_db)
+):
+    subject = crud_subject.get_subject(db, subject_id=subject_id)
+    if not subject or subject.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="无权操作")
+
+    if file.content_type not in ALLOWED_MIME_TYPES:
+        raise HTTPException(status_code=400, detail="不支持的文件类型")
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_filename = f"{subject_id}_{timestamp}_{file.filename.replace(' ', '_')}"
+    file_path = os.path.join(UPLOAD_DIR, safe_filename)
+
+    try:
+        with open(file_path, "wb") as buffer:
+            content = await file.read()
+            if len(content) > MAX_FILE_SIZE:
+                raise HTTPException(status_code=413, detail=f"文件过大，最大支持 {MAX_FILE_SIZE // (1024 * 1024)}MB")
+
+            buffer.write(content)
+        file_size = os.path.getsize(file_path)
+        file_ext = file.filename.split('.')[-1].lower()
+        needs_conversion = file_ext in ['docx', 'doc', 'pptx', 'ppt']
+
+        pdf_path = None
+        conversion_status = 'not_needed'
+
+        if needs_conversion:
+            conversion_status = 'pending'  # 标记为待转换
+            pdf_path = None  # 后台任务会填充这个值
+        crud_subject.add_file_to_subject(
+            db=db,
+            subject_id=subject_id,
+            filename=safe_filename,  # 存储文件名（带时间戳）
+            original_filename=file.filename,
+            file_path=file_path,
+            pdf_path=pdf_path,
+            conversion_status=conversion_status,
+            file_type=file.content_type,
+            file_size=file_size
+        )
+        # 确定要解析的PDF路径
+        final_pdf_path = file_path
+        # 获取刚创建的文件记录
+        db.refresh(subject)  # 刷新subject以获取最新的files
+        file_record = subject.files[-1]  # 获取最后一个文件
+        background_tasks.add_task(
+            process_pdf_parsing,
+            subject_id=subject_id,
+            file_id=file_record.id,
+            pdf_path=final_pdf_path
+        )
+    except Exception as e:
+        if os.path.exists(file_path): os.remove(file_path)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    db.refresh(subject)
+    return subject
+
+
+@router.post("/{subject_id}/files/build_graph", response_model=SubjectResponse)
+async def build_selected_files(
+        subject_id: int,
+        file_ids: List[int] = Body(..., embed=True),  # 接收 { "file_ids": [1, 2] }
+        current_user: User = Depends(get_current_user),
+        db: Session = Depends(get_db)
+):
+    """
+    提交选中的文件进行知识图谱构建
+    """
+    # 1. 验证科目所有权
+    subject = crud_subject.get_subject(db, subject_id=subject_id)
+    if not subject or subject.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="无权操作")
+
+    # 2. 调用 CRUD 开始构建
+    # 注意：这里假设 file_ids 都是合法的且属于该科目，CRUD 中已有简单过滤
+    updated_subject = crud_subject.start_graph_build(db, subject_id, file_ids)
+
+    return updated_subject
+
+
+@router.get("/{subject_id}/files/{file_id}/status")
+async def get_file_parsing_status(
+        subject_id: int,
+        file_id: int,
+        current_user: User = Depends(get_current_user),
+        db: Session = Depends(get_db)
+):
+    """
+    查询文件解析状态（前端轮询用）
+    """
+    # 验证科目权限
+    subject = crud_subject.get_subject(db, subject_id=subject_id)
+    if not subject or subject.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="无权访问")
+
+    # 获取文件记录
+    file_record = crud_subject.get_file(db, file_id=file_id)
+    if not file_record or file_record.subject_id != subject_id:
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    return {
+        "file_id": file_id,
+        "status": file_record.status.value,  # 转换枚举为字符串
+        "parsed_content_path": file_record.parsed_content_path,
+        "parsed_json_path": file_record.parsed_json_path,
+        "parsing_error": file_record.parsing_error,
+        "parse_progress": file_record.parse_progress
+    }
+
+@router.post("/{subject_id}/files/{file_id}/regenerate_toc", response_model=TocResponse)
+async def regenerate_file_toc(
+        subject_id: int,
+        file_id: int,
+        current_user: User = Depends(get_current_user),
+        db: Session = Depends(get_db)
+):
+    """
+    手动触发重新生成文件目录（用于调试或更新旧数据）
+    """
+    import json
+    from datetime import datetime, timezone
+    from app.utils.toc_extractor import extract_toc_from_parsed_files
+
+    # 1. 验证权限
+    subject = crud_subject.get_subject(db, subject_id=subject_id)
+    if not subject or subject.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="无权操作")
+
+    # 2. 验证文件存在且已解析完成
+    file_record = crud_subject.get_file(db, file_id=file_id)
+    if not file_record or file_record.subject_id != subject_id:
+        raise HTTPException(status_code=404, detail="文件不存在")
+    if file_record.status.value != "ready":
+        raise HTTPException(status_code=400, detail="文件尚未解析完成，无法生成目录")
+
+    # 3. 重新提取目录（双轨制：优先原生书签，降级到 LLM）
+    try:
+        import pypdf
+        from app.utils.toc_extractor import extract_toc_from_pdf_outline
+
+        # 取实际 PDF 路径：优先用格式转换后的 pdf_path，原文件已是 PDF 则用 file_path
+        actual_pdf_path = file_record.pdf_path if file_record.pdf_path else file_record.file_path
+
+        try:
+            total_pages = len(pypdf.PdfReader(actual_pdf_path).pages)
+        except Exception:
+            total_pages = 9999  # 读取失败时不阻断流程，越界校验放宽
+
+        native_toc = extract_toc_from_pdf_outline(actual_pdf_path, total_pages)
+
+        if native_toc:
+            toc = native_toc
+        else:
+            toc = extract_toc_from_parsed_files(subject_id, file_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"目录提取失败: {str(e)}")
+
+    # 4. 写回数据库
+    file_record.toc_json = json.dumps(toc, ensure_ascii=False)
+    file_record.toc_generated_at = datetime.now(timezone.utc)
+    db.add(file_record)
+    db.commit()
+
+    return {
+        "toc": toc,
+        "total": len(toc),
+        "message": f"目录已重新生成，共 {len(toc)} 项"
+    }
+
+
+@router.post("/{subject_id}/files/{file_id}/ocr")
+async def ocr_region(
+        subject_id: int,
+        file_id: int,
+        payload: dict,
+        current_user=Depends(get_current_user),
+        db: Session = Depends(get_db)
+):
+    """区域框选 OCR：接收前端截取的 Base64 PNG，返回识别文字"""
+    from app.services.ocr_service import ocr_from_base64
+    image_base64 = payload.get("image_base64", "")
+    if not image_base64:
+        raise HTTPException(status_code=400, detail="image_base64 不能为空")
+    text = ocr_from_base64(image_base64)
+    return {"text": text}
+
+
+@router.get("/{subject_id}/files/{file_id}/toc", response_model=TocResponse)
+async def get_file_table_of_contents(
+        subject_id: int,
+        file_id: int,
+        current_user: User = Depends(get_current_user),
+        db: Session = Depends(get_db)
+):
+    """
+    获取文件的目录结构
+
+    Args:
+        subject_id: 科目ID
+        file_id: 文件ID
+
+    Returns:
+        TocResponse: 包含目录列表的响应
+
+    Raises:
+        403: 无权访问
+        404: 文件不存在
+        400: 文件未解析完成
+    """
+    # 1. 验证科目权限
+    subject = crud_subject.get_subject(db, subject_id=subject_id)
+    if not subject or subject.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="无权访问")
+
+    # 2. 获取TOC (用 try-except)
+    try:
+        toc = crud_subject.get_file_toc(db, subject_id, file_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # 3. 边界情况处理
+    if toc is None:
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    # 4. 空目录处理
+    if len(toc) == 0:
+        return {
+            "toc": [],
+            "total": 0,
+            "message": "该文件未检测到目录结构"
+        }
+
+    # 5. 正常返回
+    return {
+        "toc": toc,
+        "total": len(toc)
+    }
+
+
+# ==================== 管理员接口 ====================
+
+@router.get("/admin/all")
+async def get_all_subjects_for_admin(
+    user_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    管理员获取所有用户的科目（可选按用户ID筛选）
+    """
+    # TODO: 添加管理员权限检查
+    # if not current_user.is_admin:
+    #     raise HTTPException(status_code=403, detail="需要管理员权限")
+
+    if user_id:
+        subjects = crud_subject.get_subjects_by_user(db, user_id)
+    else:
+        subjects = crud_subject.get_all_subjects(db)
+
+    return {"subjects": subjects}

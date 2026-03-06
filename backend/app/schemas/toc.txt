@@ -1,0 +1,38 @@
+from pydantic import BaseModel, Field
+from typing import Optional, List
+
+class TocItem(BaseModel):
+    """
+    单个目录项模型
+    """
+    title: str = Field(..., description="标题文本")
+    level: int = Field(..., ge=1, le=6, description="标题层级(1-6)")
+    page: int = Field(..., ge=1, description="页码(从1开始)")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "title": "第一章 图论基础",
+                "level": 1,
+                "page": 5
+            }
+        }
+
+class TocResponse(BaseModel):
+    """
+    目录列表响应模型
+    """
+    toc: List[TocItem] = Field(default_factory=list, description="目录项列表")
+    total: int = Field(..., ge=0, description="目录总数")
+    message: Optional[str] = Field(None, description="提示信息")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "toc": [
+                    {"title": "第一章", "level": 1, "page": 5},
+                    {"title": "1.1 基本概念", "level": 2, "page": 6}
+                ],
+                "total": 2
+            }
+        }

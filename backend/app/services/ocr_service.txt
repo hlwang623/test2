@@ -1,0 +1,64 @@
+"""
+轻量级 OCR 服务（按需，仅在区域框选时调用）
+
+优先级：
+  1. PaddleOCR（中文精度最佳，需 pip install paddlepaddle paddleocr）
+  2. pytesseract（需安装 Tesseract 二进制 + 中文语言包）
+  3. 降级：返回空字符串，前端显示 "[图片区域]"
+"""
+
+import base64
+import logging
+from io import BytesIO
+
+logger = logging.getLogger(__name__)
+
+
+def ocr_from_base64(image_base64: str) -> str:
+    """
+    接收 Base64 编码的 PNG 图片，返回识别出的文字。
+    data:image/png;base64,... 或纯 base64 均可。
+    """
+    # 去掉 data URL 前缀
+    if "," in image_base64:
+        image_base64 = image_base64.split(",", 1)[1]
+
+    image_bytes = base64.b64decode(image_base64)
+
+    # --- 方案 1：PaddleOCR ---
+    try:
+        from paddleocr import PaddleOCR
+        ocr = PaddleOCR(use_angle_cls=True, lang="ch", show_log=False)
+        import numpy as np
+        from PIL import Image
+        img = Image.open(BytesIO(image_bytes)).convert("RGB")
+        result = ocr.ocr(np.array(img), cls=True)
+        lines = []
+        for block in (result or []):
+            for line in (block or []):
+                if line and len(line) >= 2:
+                    lines.append(line[1][0])
+        text = " ".join(lines).strip()
+        logger.info(f"[OCR-Paddle] 识别完成，{len(text)} 字符")
+        return text
+    except ImportError:
+        pass
+    except Exception as e:
+        logger.warning(f"[OCR-Paddle] 识别失败: {e}")
+
+    # --- 方案 2：pytesseract ---
+    try:
+        import pytesseract
+        from PIL import Image
+        img = Image.open(BytesIO(image_bytes))
+        text = pytesseract.image_to_string(img, lang="chi_sim+eng").strip()
+        logger.info(f"[OCR-Tesseract] 识别完成，{len(text)} 字符")
+        return text
+    except ImportError:
+        pass
+    except Exception as e:
+        logger.warning(f"[OCR-Tesseract] 识别失败: {e}")
+
+    # --- 降级 ---
+    logger.warning("[OCR] 未安装任何 OCR 库，返回空字符串")
+    return ""
