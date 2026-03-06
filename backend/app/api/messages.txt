@@ -1,0 +1,135 @@
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from typing import List
+from datetime import datetime
+from pydantic import BaseModel
+
+from app.core.database import get_db
+from app.core.security import get_current_user
+from app.models.user import User
+from app.crud import message as crud_message
+
+router = APIRouter(prefix="/api/messages", tags=["messages"])
+
+
+# --- Schemas ---
+class MessageResponse(BaseModel):
+    id: int
+    type: str
+    title: str
+    sender: str
+    content: str
+    time: str  # 格式化后的时间
+    hasRedDot: bool
+    iconColor: str
+
+    class Config:
+        from_attributes = True
+
+    @staticmethod
+    def format_time(created_at: datetime) -> str:
+        """格式化时间显示"""
+        now = datetime.utcnow()
+        diff = now - created_at
+
+        if diff.total_seconds() < 60:
+            return "刚刚"
+        elif diff.total_seconds() < 3600:
+            return f"{int(diff.total_seconds() / 60)}分钟前"
+        elif diff.total_seconds() < 86400:
+            return f"{int(diff.total_seconds() / 3600)}小时前"
+        elif diff.days == 1:
+            return "昨天"
+        elif diff.days < 7:
+            return f"{diff.days}天前"
+        else:
+            return created_at.strftime("%Y-%m-%d")
+
+
+class MessageListResponse(BaseModel):
+    messages: List[MessageResponse]
+    total: int
+    unread_count: int
+
+
+# --- 接口 ---
+@router.get("/", response_model=MessageListResponse)
+def get_messages(
+        current_user: User = Depends(get_current_user),
+        db: Session = Depends(get_db)
+):
+    """获取用户的所有消息"""
+    messages = crud_message.get_user_messages(db, user_id=current_user.id)
+    unread_count = crud_message.get_unread_count(db, user_id=current_user.id)
+
+    # 转换为前端格式
+    message_responses = []
+    for msg in messages:
+        message_responses.append(MessageResponse(
+            id=msg.id,
+            type=msg.type,
+            title=msg.title,
+            sender=msg.sender,
+            content=msg.content,
+            time=MessageResponse.format_time(msg.created_at),
+            hasRedDot=not msg.is_read,
+            iconColor=msg.icon_color
+        ))
+
+    return MessageListResponse(
+        messages=message_responses,
+        total=len(messages),
+        unread_count=unread_count
+    )
+
+
+@router.put("/{message_id}/read")
+def mark_message_as_read(
+        message_id: int,
+        current_user: User = Depends(get_current_user),
+        db: Session = Depends(get_db)
+):
+    """标记单条消息为已读"""
+    message = crud_message.mark_as_read(db, message_id, current_user.id)
+
+    if not message:
+        raise HTTPException(status_code=404, detail="消息不存在")
+
+    return {"message": "已标记为已读", "message_id": message_id}
+
+
+@router.put("/read-all")
+def mark_all_messages_as_read(
+        current_user: User = Depends(get_current_user),
+        db: Session = Depends(get_db)
+):
+    """标记所有消息为已读"""
+    count = crud_message.mark_all_as_read(db, current_user.id)
+
+    return {"message": "所有消息已标记为已读", "count": count}
+
+
+@router.get("/unread-count")
+def get_unread_count(
+        current_user: User = Depends(get_current_user),
+        db: Session = Depends(get_db)
+):
+    """获取未读消息数量"""
+    count = crud_message.get_unread_count(db, current_id=current_user.id)
+
+    return {"count": count}
+
+
+@router.delete("/{message_id}")
+def delete_message(
+        message_id: int,
+        current_user: User = Depends(get_current_user),
+        db: Session = Depends(get_db)
+):
+    """删除消息"""
+    success = crud_message.delete_message(db, message_id, current_user.id)
+
+    if not success:
+        raise HTTPException(status_code=404, detail="消息不存在")
+
+    return {"message": "消息已删除", "message_id": message_id}

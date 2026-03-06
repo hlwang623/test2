@@ -1,0 +1,33 @@
+from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, DateTime, Text
+from sqlalchemy.orm import relationship
+from datetime import datetime
+from app.core.database import Base
+
+class Message(Base):
+    """用户消息通知表"""
+    __tablename__ = "messages"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # 关联用户
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    user = relationship("User", back_populates="messages")
+
+    # 消息内容
+    type = Column(String, nullable=False)  # system/study_advice/social
+    title = Column(String, nullable=False)
+    sender = Column(String, nullable=False)
+    content = Column(Text, nullable=False)
+
+    # 状态
+    is_read = Column(Boolean, default=False)
+
+    # 关联数据（可选）
+    related_subject_id = Column(Integer, ForeignKey("subjects.id"), nullable=True)
+    related_file_id = Column(Integer, nullable=True)
+
+    # 时间
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    # 图标配色（前端用）
+    icon_color = Column(String, default="bg-blue-100 text-blue-500")

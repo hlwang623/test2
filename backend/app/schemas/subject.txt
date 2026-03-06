@@ -1,0 +1,49 @@
+rom pydantic import BaseModel, Field
+from typing import Optional, List
+from datetime import datetime
+# --- 1. 基础模型 ---
+class SubjectBase(BaseModel):
+    name: str
+    description: Optional[str] = None
+    ai_instruction: Optional[str] = None
+# --- 2. 创建时使用的模型 ---
+class SubjectCreate(SubjectBase):
+    pass
+# --- 3. 文件模型 ---
+class SubjectFile(BaseModel):
+    id: int
+    file_name: str
+    file_path: str
+    original_filename: str
+    pdf_path: Optional[str] = None
+    conversion_status: str = "not_needed"
+    file_type: str
+    file_size: int
+    status: str = "pending"
+    graph_status: str = "pending"
+    parse_progress: float = 0.0
+    parsed_content_path: Optional[str] = None  # ⭐ 添加解析后的markdown路径
+    parsing_error: Optional[str] = None  # 解析错误信息（如果有）
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+# --- 4. 响应给前端的完整模型 ---
+class SubjectResponse(SubjectBase):
+    id: int
+    user_id: int
+    created_at: datetime
+    cover_color: str = "blue"
+    # 统计数据
+    total_nodes: int = 0
+    learned_nodes: int = 0
+    status: str = "empty"  # 默认为 empty
+    parse_progress: float = 0.0  # 默认为 0
+    # 包含的文件列表
+    files: List[SubjectFile] = []
+    class Config:
+        from_attributes = True
+# --- 5. 列表模型 ---
+class SubjectList(BaseModel):
+    subjects: List[SubjectResponse]
+    total: int

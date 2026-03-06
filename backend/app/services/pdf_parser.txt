@@ -1,0 +1,145 @@
+import requests
+import zipfile
+import os
+import shutil
+from pathlib import Path
+import logging
+from config import MINERU_SERVER_URL, MINERU_TIMEOUT
+
+logger = logging.getLogger(__name__)
+
+
+class PDFParsingError(Exception):
+    """PDF解析异常"""
+    pass
+
+
+def parse_pdf_via_mineru(pdf_path: str) -> dict:
+    """
+    调用远程 MinerU 服务解析 PDF，下载并解压 ZIP 包
+
+    Args:
+        pdf_path: PDF文件的本地路径
+
+    Returns:
+        {
+            "zip_path": "临时zip文件的路径",
+            "status": "success"
+        }
+    """
+    logger.info(f"开始解析 PDF: {pdf_path}")
+
+    try:
+        # 1. 读取PDF文件
+        with open(pdf_path, 'rb') as f:
+            files = {'file': (Path(pdf_path).name, f, 'application/pdf')}
+
+            # 2. 发送到远程服务器
+            # 注意：如果你的 mineru_server.py 定义的是 @app.post("/parse_pdf")
+            # 这里的 URL 应该是 MINERU_SERVER_URL + "/parse_pdf"
+            # 假设 config.py 里的 MINERU_SERVER_URL 是 http://localhost:8000
+            url = MINERU_SERVER_URL
+
+            # stream=True 用于下载大文件
+            response = requests.post(
+                url,
+                files=files,
+                timeout=MINERU_TIMEOUT,
+                stream=True
+            )
+
+        # 3. 检查HTTP状态码
+        if response.status_code != 200:
+            # 尝试读取错误信息（如果是 JSON）
+            try:
+                err = response.json()
+                error_msg = err.get('error', '未知错误')
+            except:
+                error_msg = f"HTTP状态码 {response.status_code}"
+            raise PDFParsingError(f"MinerU服务错误: {error_msg}")
+
+        # 4. 保存返回的 ZIP 文件
+        # 临时文件路径：uploads/subjects/xxx.pdf.result.zip
+        local_zip_path = f"{pdf_path}.result.zip"
+
+        with open(local_zip_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+
+        logger.info(f"结果 ZIP 已下载: {local_zip_path}")
+
+        return {
+            "zip_path": local_zip_path,
+            "status": "success"
+        }
+
+    except requests.exceptions.Timeout:
+        raise PDFParsingError("远程服务器响应超时，请稍后重试")
+    except requests.exceptions.ConnectionError:
+        raise PDFParsingError("无法连接到MinerU服务，请检查SSH隧道是否开启")
+    except Exception as e:
+        logger.error(f"MinerU 调用异常: {e}")
+        raise PDFParsingError(f"解析请求失败: {str(e)}")
+
+
+def save_markdown_to_file(parse_result: dict, subject_id: int, file_id: int) -> str:
+    """
+    解压 ZIP，整理文件结构，返回 markdown 的相对路径
+
+    Args:
+        parse_result: 上一步返回的字典，包含 "zip_path"
+    """
+    zip_path = parse_result.get("zip_path")
+
+    if not zip_path or not os.path.exists(zip_path):
+        raise PDFParsingError("解析结果文件丢失")
+
+    # 定义最终解压目录: uploads/subjects/{subject_id}/parsed/{file_id}/
+    # 这样每个文件的图片和json都独立存放，互不干扰
+    output_dir = Path(f"uploads/subjects/{subject_id}/parsed/{file_id}")
+
+    # 如果目录存在，先清空（防止旧数据干扰）
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        # 1. 解压 ZIP
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(output_dir)
+
+        # 2. 删除临时 ZIP 文件
+        try:
+            os.remove(zip_path)
+        except:
+            pass
+
+        # 3. 寻找核心的 .md 文件
+        md_file = None
+        # 遍历解压后的目录寻找 .md 文件
+        for root, dirs, files in os.walk(output_dir):
+            for file in files:
+                if file.endswith(".md") and not file.startswith("README"):  # 排除可能的 readme
+                    md_file = Path(root) / file
+                    break
+            if md_file:
+                break
+
+        if not md_file:
+            raise PDFParsingError("解压包中未找到 Markdown 内容文件")
+
+        # 4. 计算相对路径 (用于存入数据库)
+        # 我们需要存的是相对于 backend 运行目录的路径，例如 uploads/subjects/...
+        # os.getcwd() 通常是 backend 目录
+        try:
+            relative_path = os.path.relpath(md_file, os.getcwd())
+        except ValueError:
+            # 如果路径跨驱动器（Windows常见问题），则直接使用完整路径或手动拼接
+            relative_path = str(md_file)
+
+        # 统一转为正斜杠（兼容 Windows/Linux）
+        return str(relative_path).replace("\\", "/")
+
+    except Exception as e:
+        logger.error(f"文件解压处理失败: {e}")
+        raise PDFParsingError(f"文件处理失败: {str(e)}")

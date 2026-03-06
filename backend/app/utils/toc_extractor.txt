@@ -1,0 +1,448 @@
+import json
+import re
+import logging
+from pathlib import Path
+from json import JSONDecodeError
+from typing import List, Dict, Any, Optional
+from app.services.deepseek_client import deepseek_client
+
+# 尝试导入 fuzzywuzzy，如果没有安装则降级为简单的字符串匹配
+try:
+    from fuzzywuzzy import fuzz
+except ImportError:
+    fuzz = None
+    logging.warning("未安装 fuzzywuzzy 库，页码回填将使用精确匹配，建议执行: pip install fuzzywuzzy python-Levenshtein")
+
+# 配置 Logger
+logger = logging.getLogger(__name__)
+
+
+# --- 辅助函数：正则降级方案 (原逻辑) ---
+
+def determine_heading_level_regex(text: str) -> int:
+    """[Regex Fallback] 根据文本内容判断标题的层级"""
+    text = text.strip()
+    # Level 1
+    if re.match(r'^第[一二三四五六七八九十\d]+[部分章节]', text): return 1
+    if text in ['摘要', '目录', '参考文献', 'Abstract', '关键词']: return 1
+    # Level 2
+    if re.match(r'^\d+\.\s+', text): return 2
+    if re.match(r'^[一二三四五六七八九十]+、', text): return 2
+    # Level 3
+    if re.match(r'^\d+\.\d+', text): return 3
+    if re.match(r'^\(\d+\)', text): return 3
+    return 2
+
+
+def clean_title_regex(text: str) -> str:
+    """[Regex Fallback] 清洗标题文本"""
+    text = re.sub(r'\.{2,}\d+$', '', text)
+    text = ' '.join(text.split())
+    return text.strip()
+
+
+def extract_toc_with_regex_fallback(content_list: List[Dict]) -> List[Dict]:
+    """
+    [Regex Fallback] 传统的正则提取逻辑，当 LLM 失败时调用
+    """
+    logger.warning("=== [Regex降级] 开始使用正则方案提取目录 ===")
+    toc = []
+    for item in content_list:
+        if item.get('type') != 'text': continue
+        if item.get('text_level') != 1: continue  # 假设 level 1 是标题
+
+        text = item.get('text', '').strip()
+        if not text: continue
+
+        # 简单过滤掉太长的段落 (超过50字通常不是标题)
+        if len(text) > 50: continue
+
+        page_idx = item.get('page_idx', 0)
+        level = determine_heading_level_regex(text)
+        title = clean_title_regex(text)
+
+        logger.debug(f"  正则入选: page_idx={page_idx} level={level} title='{title}'")
+        toc.append({
+            'title': title,
+            'level': level,
+            'page': page_idx + 1
+        })
+
+    logger.warning(f"=== [Regex降级完成] 共提取 {len(toc)} 条目录项 ===")
+    return toc
+
+
+# --- 核心流程：LLM 智能提取 ---
+
+def build_page_text_map(content_list: List[Dict]) -> Dict[int, List[str]]:
+    """
+    单次遍历 content_list，建立 page_idx → [text, ...] 索引。
+    排除 discarded 类型（页眉页脚），供后续步骤 O(1) 查询，避免重复遍历全量数据。
+    """
+    page_text_map: Dict[int, List[str]] = {}
+    for item in content_list:
+        if item.get('type') == 'discarded':
+            continue
+        page_idx = item.get('page_idx', -1)
+        text = item.get('text', '').strip()
+        if text:
+            page_text_map.setdefault(page_idx, []).append(text)
+    logger.info(f"  [page_text_map] 建立完成，共 {len(page_text_map)} 页有效文本页")
+    return page_text_map
+
+
+def locate_toc_pages(page_text_map: Dict[int, List[str]]) -> tuple[int, int]:
+    """
+    在 page_text_map 中定位目录页的 page_idx 范围。
+    直接接受已建好的索引，无需再次遍历 content_list。
+
+    策略：
+    1. 遍历 page_text_map（已排除 discarded），收集含"目录"关键词的候选 page_idx
+    2. 对每个候选，动态向后扫描（最多10页），统计短行占比判断是否为真实目录排版
+    3. 短行定义：按 \\n 拆分文本块后，单行长度 < 60 字符
+    4. 短行占比 >= 0.55 的页认定为目录页，遇到比例断崖则停止向后延伸
+    5. 所有候选均验证失败时，降级为使用前15页
+    """
+    TOC_KEYWORDS = ['目录', '目 录', 'contents', 'table of contents']
+
+    logger.info("=== [TOC定位] 开始扫描目录页 ===")
+
+    # 1. 从 page_text_map 收集候选（按页码排序，去重）
+    candidate_pages = []
+    seen = set()
+    for page_idx in sorted(page_text_map.keys()):
+        for text in page_text_map[page_idx]:
+            if any(kw in text.strip().lower() for kw in TOC_KEYWORDS) and page_idx not in seen:
+                candidate_pages.append(page_idx)
+                seen.add(page_idx)
+                logger.info(f"  发现候选 page_idx={page_idx}，text='{text.strip()[:60]}'")
+
+    if not candidate_pages:
+        logger.warning("  ⚠️ 未找到任何目录关键词，降级为使用前15页 (page_idx 0~14)")
+        return (0, 14)
+
+    logger.info(f"  共发现 {len(candidate_pages)} 个候选位置: {candidate_pages}")
+
+    # 2. 二维联合校验：几何短行 + 语义页码密度
+    # 真实目录页：短行多 AND 行尾带数字（页码引用）
+    # 章节开头页：短行多 BUT 行尾无数字（标题/定义行）
+    TRAILING_NUMBER_RE = re.compile(r'\d+[\s.\-…·]*$')
+
+    def analyze_page(page_idx: int) -> tuple[float, float]:
+        """返回 (short_ratio, number_ratio)"""
+        texts = page_text_map.get(page_idx, [])
+        total, short, with_number = 0, 0, 0
+        for text in texts:
+            for line in text.split('\n'):
+                stripped = line.strip()
+                if stripped:
+                    total += 1
+                    if len(stripped) < 80:
+                        short += 1
+                    if TRAILING_NUMBER_RE.search(stripped):
+                        with_number += 1
+        if total == 0:
+            return 0.0, 0.0
+        return short / total, with_number / total
+
+    # 3. 逐候选验证（二维联合判断）
+    for candidate in candidate_pages:
+        toc_pages = []
+
+        for offset in range(15):
+            current_page = candidate + offset
+
+            if current_page not in page_text_map:
+                logger.debug(f"    page_idx={current_page} 无文本条目，跳过")
+                continue  # 空白页跳过，不截断扫描
+
+            short_ratio, number_ratio = analyze_page(current_page)
+            logger.debug(f"    page_idx={current_page} 短行={short_ratio:.0%} 页码行={number_ratio:.0%}")
+
+            if short_ratio >= 0.50 and number_ratio >= 0.15:
+                toc_pages.append(current_page)
+            else:
+                logger.warning(
+                    f"    page_idx={current_page} 短行={short_ratio:.0%} 页码行={number_ratio:.0%}，"
+                    f"停止向后延伸（不符合目录双重特征）"
+                )
+                break
+
+        if toc_pages:
+            toc_start, toc_end = toc_pages[0], toc_pages[-1]
+            logger.warning(
+                f"  ✅ 验证通过：真实目录范围 page_idx {toc_start} ~ {toc_end}"
+                f"（共 {len(toc_pages)} 页）"
+            )
+            return (toc_start, toc_end)
+        else:
+            logger.warning(
+                f"  ⚠️ page_idx={candidate} 验证失败：周围内容不符合目录排版特征，继续搜索"
+            )
+
+    logger.warning("  ⚠️ 所有候选均验证失败，降级为使用前15页 (page_idx 0~14)")
+    return (0, 14)
+
+
+def extract_toc_page_text(page_text_map: Dict[int, List[str]], toc_start: int, toc_end: int) -> str:
+    """
+    直接从 page_text_map 按键值提取目录页文本，时间复杂度 O(toc_pages)，无需遍历全量 content_list。
+    """
+    logger.info(f"=== [TOC文本提取] 从 page_text_map 提取 page_idx {toc_start}~{toc_end} ===")
+    lines = []
+
+    for page_idx in range(toc_start, toc_end + 1):
+        for text in page_text_map.get(page_idx, []):
+            lines.append(text)
+            logger.debug(f"  [page {page_idx}] 收录: '{text[:60]}'")
+
+    result = '\n'.join(lines)
+    logger.warning(f"  [TOC文本提取] 共收录 {len(lines)} 行，{len(result)} 字符")
+    logger.warning(f"  [TOC文本提取] 文本预览（前300字）:\n{result[:300]}")
+    return result
+
+
+def clean_toc_text(raw_text: str) -> str:
+    """
+    在发送给 DeepSeek 前对目录页文本进行预清洗，减少噪音 Token。
+
+    清洗规则（不误杀真实目录条目）：
+    1. 去除纯空行
+    2. 剔除超长文本（去空格后 > 80字符）：大概率是前言正文或版权声明
+    3. 剔除冗余页眉/页脚：匹配 "目录"、"目 录"、"contents" 等独立标题行
+    4. 剔除无意义单字符：长度为1且非数字/字母（如 ·、· 等装饰性字符）
+    """
+    TOC_HEADER_RE = re.compile(r'^(目\s*录|contents|table\s+of\s+contents)$', re.IGNORECASE)
+
+    cleaned = []
+    removed = 0
+
+    for line in raw_text.split('\n'):
+        stripped = line.strip()
+
+        if not stripped:
+            continue  # 规则1：纯空行
+
+        if len(stripped.replace(' ', '')) > 80:
+            removed += 1
+            logger.debug(f"  [清洗] 剔除超长行({len(stripped)}字符): '{stripped[:40]}...'")
+            continue  # 规则2：超长文本
+
+        if TOC_HEADER_RE.match(stripped):
+            removed += 1
+            logger.debug(f"  [清洗] 剔除页眉行: '{stripped}'")
+            continue  # 规则3：冗余页眉/页脚
+
+        if len(stripped) == 1 and not stripped.isalnum():
+            removed += 1
+            logger.debug(f"  [清洗] 剔除无意义字符: '{stripped}'")
+            continue  # 规则4：无意义单字符
+
+        cleaned.append(stripped)
+
+    result = '\n'.join(cleaned)
+    logger.warning(
+        f"  [文本清洗] 清洗前 {len(raw_text)} 字符 / {len(raw_text.splitlines())} 行 → "
+        f"清洗后 {len(result)} 字符 / {len(cleaned)} 行，剔除 {removed} 行"
+    )
+    return result
+
+
+def prepare_raw_items_for_llm(content_list: List[Dict]) -> List[Dict]:
+    """
+    步骤 1: 数据预处理 - 从海量 MinerU 数据中筛选出 '候选标题'
+    """
+    raw_items = []
+
+    # 策略：
+    # 1. 前 10 页的所有内容 (通常包含目录页、前言)
+    # 2. 全文中 text_level=1 的内容 (潜在的一级标题)
+    # 3. 任何包含 '目录', 'Contents', 'Index' 字样的页面内容
+
+    seen_texts = set()  # 去重
+
+    for i, item in enumerate(content_list):
+        text = item.get('text', '').strip()
+        if not text: continue
+
+        page_idx = item.get('page_idx', 0)
+        is_early_page = page_idx < 10
+        is_level_one = item.get('text_level') == 1
+        is_list = item.get('type') == 'list'
+
+        # 筛选逻辑
+        should_include = False
+
+        if is_early_page:
+            # 前几页放宽标准，包含所有较短的文本 (可能是目录项)
+            if len(text) < 100: should_include = True
+        elif is_level_one:
+            # 后面的页面只取 Level 1
+            if len(text) < 100: should_include = True
+
+        # 特殊处理：目录页如果是 List 类型
+        if is_list and is_early_page:
+            # 展平 List
+            for list_item in item.get('list_items', []):
+                if isinstance(list_item, str) and list_item not in seen_texts:
+                    raw_items.append({"text": list_item, "page": page_idx})
+                    seen_texts.add(list_item)
+            continue  # List 处理完直接跳过
+
+        if should_include and text not in seen_texts:
+            raw_items.append({
+                "text": text,
+                "page": page_idx  # 用于大致定位，实际回填用模糊匹配
+            })
+            seen_texts.add(text)
+
+    # 限制 Token 消耗：如果候选太多，只取前 150 条 (通常足够覆盖目录)
+    # 或者取前 50 条 + 中间均匀采样
+    return raw_items[:200]
+
+
+def backfill_page_numbers(cleaned_toc: List[Dict], content_list: List[Dict]) -> List[Dict]:
+    """
+    步骤 3: 页码回填 - 将 Deepseek 清洗后的标题映射回真实页码
+    """
+    final_toc = []
+
+    # 建立索引以加速查找 (如果 content_list 很大)
+    # 这里直接双重循环，对于单本书来说性能可接受
+
+    for toc_item in cleaned_toc:
+        target_text = toc_item.get('original_text', '')
+        if not target_text: continue
+
+        best_page = -1
+        best_score = 0
+
+        # 在 content_list 中寻找最相似的文本
+        # 优化：优先在 toc_item 附近的页面找？不，目录可能在第2页，指向第100页
+
+        for content_item in content_list:
+            source_text = content_item.get('text', '')
+            if not source_text:
+                # 尝试检查 list 类型
+                if content_item.get('type') == 'list':
+                    source_text = " ".join(content_item.get('list_items', []))
+                else:
+                    continue
+
+            # 计算相似度
+            if fuzz:
+                score = fuzz.ratio(target_text, source_text)
+            else:
+                score = 100 if target_text in source_text else 0
+
+            # 记录最佳匹配
+            if score > best_score:
+                best_score = score
+                best_page = content_item.get('page_idx', 0)
+
+        # 阈值判定：匹配度 > 60% 才认为是找到了 (防止乱指)
+        # 如果 Deepseek 返回的 original_text 是真的 original，通常是 100%
+        if best_score > 60:
+            final_toc.append({
+                'title': toc_item['title'],
+                'level': toc_item['level'],
+                'page': best_page + 1  # 转换为人类可读页码 (1-based)
+            })
+        else:
+            logger.warning(f"页码回填失败: '{target_text}' (Max Score: {best_score})")
+            # 策略：如果找不到页码，可以选择丢弃，或者默认指向第1页
+            # 这里选择丢弃，保证跳转准确性
+
+    return final_toc
+
+
+def extract_toc_from_parsed_files(subject_id: int, file_id: int) -> list[dict]:
+    """
+    主入口：从 MinerU 解析结果中提取目录结构 (优先 LLM，失败降级)
+    """
+    base_dir = Path(f"uploads/subjects/{subject_id}/parsed/{file_id}")
+
+    # 1. 查找解析文件
+    json_files = list(base_dir.glob("*_content_list.json"))
+    if not json_files:
+        logger.warning(f"未找到解析文件: subject={subject_id}, file={file_id}")
+        return []
+
+    json_path = json_files[0]
+
+    try:
+        with open(json_path, 'r', encoding='utf-8') as f:
+            content_list = json.load(f)
+    except Exception as e:
+        logger.error(f"读取解析文件失败: {e}")
+        return []
+
+    # 2. 尝试使用 Deepseek LLM 提取
+    try:
+        logger.info(f"=== [TOC提取主流程] file_id={file_id}，content_list 共 {len(content_list)} 个块 ===")
+
+        # 2.1 单次遍历建立页面文本索引（供后续所有步骤复用，避免重复遍历）
+        page_text_map = build_page_text_map(content_list)
+
+        # 2.2 定位目录页（直接使用 page_text_map，无需再次遍历 content_list）
+        toc_start, toc_end = locate_toc_pages(page_text_map)
+
+        # 2.3 动态锚点法计算偏移量
+        # 新假设：目录结束后的第一页对应 LLM 提取到的最小有效逻辑页码（而非绝对第1页）
+        # offset = P_anchor - L_anchor
+        #   P_anchor = toc_end + 1        （物理锚点：正文起始的 page_idx）
+        #   L_anchor = min(logical_pages) （逻辑锚点：目录中最小的有效页码）
+        # 映射：real_page_idx = logical_page + offset，page = real_page_idx + 1
+
+        # 2.4 提取目录页文本（O(1) 字典查询，无冗余遍历）
+        toc_raw_text = extract_toc_page_text(page_text_map, toc_start, toc_end)
+        if not toc_raw_text.strip():
+            raise ValueError("目录页文本为空，无法继续")
+
+        # 2.5 预清洗文本：减少噪音 Token，加速 DeepSeek 推理
+        toc_cleaned_text = clean_toc_text(toc_raw_text)
+        if not toc_cleaned_text.strip():
+            raise ValueError("文本清洗后为空，无法继续")
+
+        # 2.6 调用 LLM 接口（含OCR纠错，直接返回逻辑页码）
+        toc_data = deepseek_client.extract_toc_from_text(toc_cleaned_text)
+        if not toc_data:
+            raise ValueError("LLM 返回空目录")
+
+        # 2.5 动态锚点法计算偏移量并映射页码
+        P_anchor = toc_end + 1
+        valid_logical_pages = [item.get('logical_page', 0) for item in toc_data if item.get('logical_page', 0) > 0]
+        L_anchor = min(valid_logical_pages) if valid_logical_pages else 1
+        offset = P_anchor - L_anchor
+        logger.warning(
+            f"  [动态锚点] P_anchor={P_anchor}, L_anchor={L_anchor}, offset={offset} "
+            f"(即逻辑页 {L_anchor} 对应 page_idx {P_anchor})"
+        )
+
+        final_toc = []
+        for item in toc_data:
+            logical_page = item.get('logical_page', L_anchor)
+            real_page_idx = logical_page + offset
+            logger.debug(
+                f"  [{item.get('level', '?')}级] '{item.get('title', '')[:50]}' "
+                f"逻辑页={logical_page} → page_idx={real_page_idx} → 显示页={real_page_idx + 1}"
+            )
+            final_toc.append({
+                'title': item['title'],
+                'level': item['level'],
+                'page': real_page_idx + 1  # +1 转为1-based，与前端对齐
+            })
+
+        if not final_toc:
+            raise ValueError("页码映射后结果为空")
+
+        logger.info(f"=== [TOC提取完成] 共 {len(final_toc)} 条，offset={offset} ===")
+        for entry in final_toc:
+            logger.info(f"  [{entry['level']}] {entry['title']} → 第{entry['page']}页")
+
+        return final_toc
+
+    except Exception as e:
+        logger.error(f"LLM 提取失败，降级到 Regex 方案。原因: {str(e)}")
+        # 3. 失败降级 (Fallback)
+        return extract_toc_with_regex_fallback(content_list)
